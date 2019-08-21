@@ -18,6 +18,7 @@
 package org.apache.flink.streaming.connectors.kafka.internal;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.metrics.Gauge;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
 import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
@@ -26,23 +27,20 @@ import org.apache.flink.streaming.connectors.kafka.internals.AbstractFetcher;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaCommitCallback;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartition;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionState;
+import org.apache.flink.streaming.connectors.kafka.serialization.KakfaWithHeadersDeserializationSchema;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.streaming.util.serialization.KeyedDeserializationSchema;
 import org.apache.flink.util.SerializedValue;
-
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.Header;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
-
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 
 import static org.apache.flink.util.Preconditions.checkState;
 
@@ -58,17 +56,38 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 
 	// ------------------------------------------------------------------------
 
-	/** The schema to convert between Kafka's byte messages, and Flink's objects. */
+	/**
+	 * The schema to convert between Kafka's byte messages, and Flink's objects.
+	 */
 	private final KeyedDeserializationSchema<T> deserializer;
 
-	/** The handover of data and exceptions between the consumer thread and the task thread. */
+	/**
+	 * The handover of data and exceptions between the consumer thread and the task thread.
+	 */
 	private final Handover handover;
 
-	/** The thread that runs the actual KafkaConsumer and hand the record batches to this fetcher. */
+	/**
+	 * The thread that runs the actual KafkaConsumer and hand the record batches to this fetcher.
+	 */
 	private final KafkaConsumerThread consumerThread;
 
-	/** Flag to mark the main work loop as alive. */
+	/**
+	 * Flag to mark the main work loop as alive.
+	 */
 	private volatile boolean running = true;
+
+	private transient long proxyToKafka1Delay;
+	private transient long kafka1ToFlinkDelay;
+	private transient long proxyToFlinkDelay;
+	private transient long flinkToKafka2Delay;
+	private transient long totalDelay;
+	private transient long proxyRecvTime;
+	private transient long kafka1RecvTime;
+	private transient long flinkRecvTime;
+	private transient long kafka2RecvTime;
+	private boolean logEnable = true;
+	private final long max = 7 * 24 * 3600 * 1000;
+	private final String filterTopic = "qukan_client_collect_cmd_under8_v3";
 
 	// ------------------------------------------------------------------------
 
@@ -111,6 +130,61 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 			useMetrics,
 			consumerMetricGroup,
 			subtaskMetricGroup);
+
+		consumerMetricGroup.gauge("proxyToKafka1Delay", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return proxyToKafka1Delay;
+			}
+		});
+		consumerMetricGroup.gauge("kafka1ToFlinkDelay", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return kafka1ToFlinkDelay;
+			}
+		});
+		consumerMetricGroup.gauge("proxyToFlinkDelay", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return proxyToFlinkDelay;
+			}
+		});
+		consumerMetricGroup.gauge("flinkToKafka2Delay", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return flinkToKafka2Delay;
+			}
+		});
+		consumerMetricGroup.gauge("totalDelay", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return totalDelay;
+			}
+		});
+		consumerMetricGroup.gauge("proxyRecvTime", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return proxyRecvTime;
+			}
+		});
+		consumerMetricGroup.gauge("kafka1RecvTime", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return kafka1RecvTime;
+			}
+		});
+		consumerMetricGroup.gauge("flinkRecvTime", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return flinkRecvTime;
+			}
+		});
+		consumerMetricGroup.gauge("kafka2RecvTime", new Gauge<Long>() {
+			@Override
+			public Long getValue() {
+				return kafka2RecvTime;
+			}
+		});
 	}
 
 	// ------------------------------------------------------------------------
@@ -137,10 +211,13 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 						records.records(partition.getKafkaPartitionHandle());
 
 					for (ConsumerRecord<byte[], byte[]> record : partitionRecords) {
-						final T value = deserializer.deserialize(
-							record.key(), record.value(),
-							record.topic(), record.partition(), record.offset());
-
+//						// rebuild record, add header information
+						record = rebuildRecordHeaders(record);
+//						// rebuild value, add header into value
+						final T value = addHeadersIntoValue(record);
+//						final T value = deserializer.deserialize(
+//							record.key(), record.value(),
+//							record.topic(), record.partition(), record.offset());
 						if (deserializer.isEndOfStream(value)) {
 							// end of stream signaled
 							running = false;
@@ -153,8 +230,7 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 					}
 				}
 			}
-		}
-		finally {
+		} finally {
 			// this signals the consumer thread that no more work is to be done
 			consumerThread.shutdown();
 		}
@@ -162,12 +238,87 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 		// on a clean exit, wait for the runner thread
 		try {
 			consumerThread.join();
-		}
-		catch (InterruptedException e) {
+		} catch (InterruptedException e) {
 			// may be the result of a wake-up interruption after an exception.
 			// we ignore this here and only restore the interruption state
 			Thread.currentThread().interrupt();
 		}
+	}
+
+	protected ConsumerRecord<byte[], byte[]> rebuildRecordHeaders(ConsumerRecord<byte[], byte[]> record) {
+		Header[] headers = record.headers().toArray();
+		if (headers.length == 0) {
+			LOG.info("topic:{}, headers.length == 0, please check!", record.topic());
+		} else if (headers.length == 1) {
+			for (Header header : headers) {
+				if ("proxy_recv_time".equals(header.key())) {
+					proxyRecvTime = Long.parseLong(new String(header.value()));
+				}
+			}
+			kafka1RecvTime = record.timestamp();
+			flinkRecvTime = System.currentTimeMillis();
+			proxyToKafka1Delay = kafka1RecvTime - proxyRecvTime;
+			kafka1ToFlinkDelay = flinkRecvTime - kafka1RecvTime;
+			proxyToFlinkDelay = flinkRecvTime - proxyRecvTime;
+
+			record.headers().add("kafka1_recv_time", String.valueOf(kafka1RecvTime).getBytes());
+			record.headers().add("flink_recv_time", String.valueOf(flinkRecvTime).getBytes());
+			record.headers().add("proxy_kafka1_delay", String.valueOf(proxyToKafka1Delay).getBytes());
+			record.headers().add("kafka1_flink_delay", String.valueOf(kafka1ToFlinkDelay).getBytes());
+			record.headers().add("proxy_flink_delay", String.valueOf(proxyToFlinkDelay).getBytes());
+		} else if (headers.length >= 6) {
+			long value;
+			kafka2RecvTime = record.timestamp();
+			for (Header header : headers) {
+				value = Long.parseLong(new String(header.value()));
+				switch (header.key()) {
+					case "proxy_recv_time":
+						proxyRecvTime = value;
+						break;
+					case "kafka1_recv_time":
+						kafka1RecvTime = value;
+						break;
+					case "flink_recv_time":
+						flinkRecvTime = value;
+						break;
+					case "proxy_kafka1_delay":
+						proxyToKafka1Delay = value;
+						break;
+					case "kafka1_flink_delay":
+						kafka1ToFlinkDelay = value;
+						break;
+					case "proxy_flink_delay":
+						proxyToFlinkDelay = value;
+						break;
+					default:
+						break;
+				}
+			}
+			flinkToKafka2Delay = kafka2RecvTime - flinkRecvTime;
+			totalDelay = kafka2RecvTime - proxyRecvTime;
+		}
+		return record;
+	}
+
+	protected T addHeadersIntoValue(ConsumerRecord<byte[], byte[]> record) {
+		T value = null;
+		try {
+			value = ((KakfaWithHeadersDeserializationSchema<T>) deserializer).deserializeWithHeaders(
+				record.headers().toArray(),
+				record.key(), record.value(),
+				record.topic(), record.partition(), record.offset());
+		} catch (Exception e) {
+			LOG.error("addHeadersIntoValue failed", e);
+		}
+		if (logEnable) {
+			LOG.info("topic:{}, headers:{}", record.topic(), record.headers().toArray());
+			LOG.info("proxyRecvTime:{}, kafka1RecvTime:{}, flinkRecvTime:{}, kafka2RecvTime:{}, proxyToKafka1Delay:{}," +
+					" kafka1ToFlinkDelay:{}, proxyToFlinkDelay:{}, flinkToKafka2Delay:{}, totalDelay",
+				proxyRecvTime, kafka1RecvTime, flinkRecvTime, kafka2RecvTime, proxyToKafka1Delay,
+				kafka1ToFlinkDelay, proxyToFlinkDelay, flinkToKafka2Delay, totalDelay);
+			logEnable = false;
+		}
+		return value;
 	}
 
 	@Override
@@ -183,7 +334,6 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 		KafkaTopicPartitionState<TopicPartition> partition,
 		long offset,
 		ConsumerRecord<?, ?> consumerRecord) throws Exception {
-
 		emitRecordWithTimestamp(record, partition, offset, consumerRecord.timestamp());
 	}
 
