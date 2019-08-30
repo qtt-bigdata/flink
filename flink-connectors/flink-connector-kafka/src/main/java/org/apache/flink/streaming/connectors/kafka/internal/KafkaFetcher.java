@@ -28,6 +28,7 @@ import org.apache.flink.streaming.connectors.kafka.internals.KafkaCommitCallback
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartition;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionState;
 import org.apache.flink.streaming.connectors.kafka.serialization.KakfaWithHeadersDeserializationSchema;
+import org.apache.flink.streaming.connectors.kafka.serialization.UserDefineVariable;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.streaming.util.serialization.KeyedDeserializationSchema;
 import org.apache.flink.util.SerializedValue;
@@ -86,8 +87,7 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 	private transient long flinkRecvTime;
 	private transient long kafka2RecvTime;
 	private boolean logEnable = true;
-	private final long max = 7 * 24 * 3600 * 1000;
-	private final String filterTopic = "qukan_client_collect_cmd_under8_v3";
+	private int logCount = 0;
 
 	// ------------------------------------------------------------------------
 
@@ -131,60 +131,67 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 			consumerMetricGroup,
 			subtaskMetricGroup);
 
-		consumerMetricGroup.gauge("proxyToKafka1Delay", new Gauge<Long>() {
+		String topicName = kafkaProperties.getProperty("metric.topic");
+		if ("false".equals(kafkaProperties.getProperty("use.default.schema"))) {
+			UserDefineVariable.UseDefaultSchema = false;
+		} else {
+			UserDefineVariable.UseDefaultSchema = true;
+		}
+
+		consumerMetricGroup.addGroup("proxyToKafka1Delay").gauge(topicName, new Gauge<Long>() {
 			@Override
 			public Long getValue() {
 				return proxyToKafka1Delay;
 			}
 		});
-		consumerMetricGroup.gauge("kafka1ToFlinkDelay", new Gauge<Long>() {
+		consumerMetricGroup.addGroup("kafka1ToFlinkDelay").gauge(topicName, new Gauge<Long>() {
 			@Override
 			public Long getValue() {
 				return kafka1ToFlinkDelay;
 			}
 		});
-		consumerMetricGroup.gauge("proxyToFlinkDelay", new Gauge<Long>() {
+		consumerMetricGroup.addGroup("proxyToFlinkDelay").gauge(topicName, new Gauge<Long>() {
 			@Override
 			public Long getValue() {
 				return proxyToFlinkDelay;
 			}
 		});
-		consumerMetricGroup.gauge("flinkToKafka2Delay", new Gauge<Long>() {
+		consumerMetricGroup.addGroup("flinkToKafka2Delay").gauge(topicName, new Gauge<Long>() {
 			@Override
 			public Long getValue() {
 				return flinkToKafka2Delay;
 			}
 		});
-		consumerMetricGroup.gauge("totalDelay", new Gauge<Long>() {
+		consumerMetricGroup.addGroup("totalDelay").gauge(topicName, new Gauge<Long>() {
 			@Override
 			public Long getValue() {
 				return totalDelay;
 			}
 		});
-		consumerMetricGroup.gauge("proxyRecvTime", new Gauge<Long>() {
-			@Override
-			public Long getValue() {
-				return proxyRecvTime;
-			}
-		});
-		consumerMetricGroup.gauge("kafka1RecvTime", new Gauge<Long>() {
-			@Override
-			public Long getValue() {
-				return kafka1RecvTime;
-			}
-		});
-		consumerMetricGroup.gauge("flinkRecvTime", new Gauge<Long>() {
-			@Override
-			public Long getValue() {
-				return flinkRecvTime;
-			}
-		});
-		consumerMetricGroup.gauge("kafka2RecvTime", new Gauge<Long>() {
-			@Override
-			public Long getValue() {
-				return kafka2RecvTime;
-			}
-		});
+//		consumerMetricGroup.addGroup("proxyRecvTime").gauge(topicName, new Gauge<Long>() {
+//			@Override
+//			public Long getValue() {
+//				return proxyRecvTime;
+//			}
+//		});
+//		consumerMetricGroup.addGroup("kafka1RecvTime").gauge(topicName, new Gauge<Long>() {
+//			@Override
+//			public Long getValue() {
+//				return kafka1RecvTime;
+//			}
+//		});
+//		consumerMetricGroup.addGroup("flinkRecvTime").gauge(topicName, new Gauge<Long>() {
+//			@Override
+//			public Long getValue() {
+//				return flinkRecvTime;
+//			}
+//		});
+//		consumerMetricGroup.addGroup("kafka2RecvTime").gauge(topicName, new Gauge<Long>() {
+//			@Override
+//			public Long getValue() {
+//				return kafka2RecvTime;
+//			}
+//		});
 	}
 
 	// ------------------------------------------------------------------------
@@ -211,19 +218,32 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 						records.records(partition.getKafkaPartitionHandle());
 
 					for (ConsumerRecord<byte[], byte[]> record : partitionRecords) {
-//						// rebuild record, add header information
-						record = rebuildRecordHeaders(record);
-//						// rebuild value, add header into value
-						final T value = addHeadersIntoValue(record);
-//						final T value = deserializer.deserialize(
-//							record.key(), record.value(),
-//							record.topic(), record.partition(), record.offset());
+						final T value;
+						Header[] headers = record.headers().toArray();
+						if (UserDefineVariable.UseDefaultSchema) {
+							value = deserializer.deserialize(
+								record.key(), record.value(),
+								record.topic(), record.partition(), record.offset());
+						} else {
+							List<String> headerKeys = new ArrayList<>();
+							for (Header header : headers) {
+								headerKeys.add(header.key());
+							}
+							if (headerKeys.contains("proxy_recv_time")) {
+								// rebuild record, add header information
+								record = rebuildRecordHeaders(record, headerKeys.size());
+								value = addHeadersIntoValue(record);
+							} else {
+								value = deserializer.deserialize(
+									record.key(), record.value(),
+									record.topic(), record.partition(), record.offset());
+							}
+						}
 						if (deserializer.isEndOfStream(value)) {
 							// end of stream signaled
 							running = false;
 							break;
 						}
-
 						// emit the actual record. this also updates offset state atomically
 						// and deals with timestamps and watermark generation
 						emitRecord(value, partition, record.offset(), record);
@@ -245,16 +265,10 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 		}
 	}
 
-	protected ConsumerRecord<byte[], byte[]> rebuildRecordHeaders(ConsumerRecord<byte[], byte[]> record) {
+	protected ConsumerRecord<byte[], byte[]> rebuildRecordHeaders(ConsumerRecord<byte[], byte[]> record, int length) {
 		Header[] headers = record.headers().toArray();
-		if (headers.length == 0) {
-			LOG.info("topic:{}, headers.length == 0, please check!", record.topic());
-		} else if (headers.length == 1) {
-			for (Header header : headers) {
-				if ("proxy_recv_time".equals(header.key())) {
-					proxyRecvTime = Long.parseLong(new String(header.value()));
-				}
-			}
+		if (length == 1) {
+			proxyRecvTime = Long.parseLong(new String(headers[0].value()));
 			kafka1RecvTime = record.timestamp();
 			flinkRecvTime = System.currentTimeMillis();
 			proxyToKafka1Delay = kafka1RecvTime - proxyRecvTime;
@@ -266,7 +280,7 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 			record.headers().add("proxy_kafka1_delay", String.valueOf(proxyToKafka1Delay).getBytes());
 			record.headers().add("kafka1_flink_delay", String.valueOf(kafka1ToFlinkDelay).getBytes());
 			record.headers().add("proxy_flink_delay", String.valueOf(proxyToFlinkDelay).getBytes());
-		} else if (headers.length >= 6) {
+		} else if (length >= 6) {
 			long value;
 			kafka2RecvTime = record.timestamp();
 			for (Header header : headers) {
@@ -308,7 +322,10 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 				record.key(), record.value(),
 				record.topic(), record.partition(), record.offset());
 		} catch (Exception e) {
-			LOG.error("addHeadersIntoValue failed", e);
+			if (this.logCount < 30) {
+				LOG.error("addHeadersIntoValue failed", e);
+				this.logCount++;
+			}
 		}
 		if (logEnable) {
 			LOG.info("topic:{}, headers:{}", record.topic(), record.headers().toArray());

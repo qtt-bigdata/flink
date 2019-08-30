@@ -45,6 +45,7 @@ import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkFixedPartiti
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaDelegatePartitioner;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaPartitioner;
 import org.apache.flink.streaming.connectors.kafka.serialization.KafkaWithHeadersSerializationSchema;
+import org.apache.flink.streaming.connectors.kafka.serialization.UserDefineVariable;
 import org.apache.flink.streaming.util.serialization.KeyedSerializationSchema;
 import org.apache.flink.streaming.util.serialization.KeyedSerializationSchemaWrapper;
 import org.apache.flink.util.ExceptionUtils;
@@ -231,6 +232,8 @@ public class FlinkKafkaProducer<IN>
 	 * Semantic chosen for this instance.
 	 */
 	protected FlinkKafkaProducer.Semantic semantic;
+
+	private int logCount = 30;
 
 	// -------------------------------- Runtime fields ------------------------------------------
 
@@ -593,54 +596,56 @@ public class FlinkKafkaProducer<IN>
 
 	@Override
 	public void invoke(FlinkKafkaProducer.KafkaTransactionState transaction, IN message, Context context) throws FlinkKafkaException {
-		checkErroneous();
-
 		IN next = message;
-		Map<String, byte[]> map = new HashMap<>();
-		try {
-			ByteArrayInputStream byteInput = new ByteArrayInputStream((byte[]) message);
-			ObjectInputStream inputStream;
-			inputStream = new ObjectInputStream(byteInput);
-			map = (Map<String, byte[]>) inputStream.readObject();
-			if (map.size() > 0 && map.keySet().contains("message")) {
-				next = (IN) map.get("message");
-			} else {
-				LOG.info("map:{}, inputStream convert to map failed!", map);
-			}
-		} catch (Exception e) {
-			LOG.info("message:{}, message convert to map failed!", message);
-		}
-
 		byte[] serializedKey = null;
 		byte[] serializedValue = null;
 		String targetTopic = null;
 
-		try {
-			serializedKey = ((KafkaWithHeadersSerializationSchema) schema).serializeKey(next);
-			serializedValue = ((KafkaWithHeadersSerializationSchema) schema).serializeValue(next);
-			targetTopic = ((KafkaWithHeadersSerializationSchema) schema).getTargetTopic(next);
-		} catch (Exception e) {
-			LOG.info("KafkaWithHeadersSerializationSchema failed, next :{}, e: {}", next, e);
+		Map<String, byte[]> map = new HashMap<>();
+
+		if (UserDefineVariable.UseDefaultSchema) {
+			serializedKey = schema.serializeKey(next);
+			serializedValue = schema.serializeValue(next);
+			targetTopic = schema.getTargetTopic(next);
+		} else {
+			try (ObjectInputStream inputStream = new ObjectInputStream(new ByteArrayInputStream((byte[]) message))) {
+				map = (Map<String, byte[]>) inputStream.readObject();
+				if (map.size() > 0 && map.keySet().contains("message")) {
+					next = (IN) map.get("message");
+					serializedKey = ((KafkaWithHeadersSerializationSchema) schema).serializeKey(next);
+					serializedValue = ((KafkaWithHeadersSerializationSchema) schema).serializeValue(next);
+					targetTopic = ((KafkaWithHeadersSerializationSchema) schema).getTargetTopic(next);
+					//log information
+					if (logEnable && map.size() > 0) {
+						LOG.info("message:{}, next: {}, map:{}, map keyset:{}",
+							message, new String(map.get("message")), map, map.keySet());
+						LOG.info("targetTopic:{}, serializedKey: {}, serializedValue:{}, Value:{}",
+							targetTopic, serializedKey, serializedValue, new String(serializedValue));
+						logEnable = false;
+					}
+				} else {
+					serializedKey = schema.serializeKey(next);
+					serializedValue = schema.serializeValue(next);
+					targetTopic = schema.getTargetTopic(next);
+					if (logCount > 0) {
+						LOG.info("InputStream convert to map failed , map:{}", map);
+						logCount--;
+					}
+				}
+			} catch (Exception e) {
+				if (logCount > 0) {
+					LOG.info("KafkaWithHeadersSerializationSchema failed, error: {}", e);
+					logCount--;
+				}
+			}
 		}
 
-//		byte[] serializedKey = schema.serializeKey(next);
-//		byte[] serializedValue = schema.serializeValue(next);
-//		String targetTopic = schema.getTargetTopic(next);
 		if (targetTopic == null) {
 			targetTopic = defaultTopicId;
 		}
 		Long timestamp = null;
 		if (this.writeTimestampToKafka) {
 			timestamp = context.timestamp();
-		}
-
-		//log information
-		if (logEnable && map.size() > 0) {
-			LOG.info("message:{}, next: {}, map:{}, map keyset:{}",
-				message, new String(map.get("message")), map, map.keySet());
-			LOG.info("targetTopic:{}, serializedKey: {}, serializedValue:{}, Value:{}",
-				targetTopic, serializedKey, serializedValue, new String(serializedValue));
-			logEnable = false;
 		}
 
 		ProducerRecord<byte[], byte[]> record;
@@ -660,10 +665,13 @@ public class FlinkKafkaProducer<IN>
 			record = new ProducerRecord<>(targetTopic, null, timestamp, serializedKey, serializedValue);
 		}
 		pendingRecords.incrementAndGet();
-		//add header
-		for (String key : map.keySet()) {
-			if (!"message".equals(key)) {
-				record.headers().add(key, map.get(key));
+
+		if (!UserDefineVariable.UseDefaultSchema) {
+			//add header
+			for (String key : map.keySet()) {
+				if (!"message".equals(key)) {
+					record.headers().add(key, map.get(key));
+				}
 			}
 		}
 		transaction.producer.send(record, callback);

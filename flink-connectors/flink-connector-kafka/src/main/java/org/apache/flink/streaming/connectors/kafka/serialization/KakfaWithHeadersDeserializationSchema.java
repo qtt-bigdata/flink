@@ -34,8 +34,8 @@ public class KakfaWithHeadersDeserializationSchema<T> implements KeyedDeserializ
 		}
 		map.put("message", message);
 
-		try (ByteArrayOutputStream byteOut = new ByteArrayOutputStream()) {
-			ObjectOutputStream out = new ObjectOutputStream(byteOut);
+		try (ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
+			 ObjectOutputStream out = new ObjectOutputStream(byteOut)) {
 			out.writeObject(map);
 			return (T) byteOut.toByteArray();
 		} catch (Exception e) {
